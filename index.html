@@ -24,24 +24,33 @@
 <canvas id="resultado"></canvas>
 <a id="descargar" download="foto-estilo.png" href="#">Descargar resultado</a>
 <p>Tu foto se procesa en tu propio navegador y no se sube a ningún servidor.</p>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
 <script>
 /* Prueba de estilos Johnson (Pixeluz) en el navegador.
-   Modelos .tflite (Johnson, TransformerNet): entrada/salida [1,256,256,3]
-   FP32, RGB en [0,1]. Solo aceptan 256x256: la foto se parte en tiles de
-   256 con solape de 64 y mezcla lineal, igual que la verificación local
-   (verify_ukiyoe_tflite.py). Todo corre en el navegador con tfjs-tflite;
+   Modelos ONNX (Johnson, TransformerNet): entrada/salida [1,3,256,256]
+   NCHW, RGB en [0,1], nombres 'input' / 'output', opset 11.
+   Se usa ONNX Runtime Web 1.18.0 desde jsDelivr: la versión anterior de
+   esta página usaba tfjs-tflite y se colgaba en "Cargando modelo…" sin
+   error (reproducido 3/3). Se eligió la 1.18.0 porque es la más reciente
+   que todavía incluye ort-wasm-simd.wasm (un solo hilo, SIMD); desde la
+   1.19.2 solo queda la versión threaded, que necesita SharedArrayBuffer
+   (cabeceras COOP/COEP) y GitHub Pages no las envía, así que no cargaría.
+   Por eso numThreads = 1: un hilo, sin multihilo, funciona en Pages.
+   Solo aceptan 256x256: la foto se parte en tiles de 256 con solape de
+   64 y mezcla lineal, igual que la verificación local
+   (verify_ukiyoe_tflite.py). Todo corre en el navegador con ONNX Runtime;
    la foto nunca sale del dispositivo. */
 const TILE = 256, OVERLAP = 64, STRIDE = TILE - OVERLAP;
 const MAX_LADO = 2048;
 const MODELOS = {
-  vangogh: { url: 'models/johnson_vangogh_fp32.tflite', etiqueta: 'Van Gogh' },
-  ukiyoe: { url: 'models/johnson_ukiyoe_fp32.tflite', etiqueta: 'Ukiyo-e' }
+  vangogh: { url: 'models/johnson_vangogh.onnx', etiqueta: 'Van Gogh' },
+  ukiyoe: { url: 'models/johnson_ukiyoe.onnx', etiqueta: 'Ukiyo-e' }
 };
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/wasm/';
+const ORT_VERSION = '1.18.0';
+const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VERSION + '/dist/';
+const ENTRADA = 'input', SALIDA = 'output';
 
-/* --- Funciones puras (sin DOM ni tf): mismas matemáticas que el
+/* --- Funciones puras (sin DOM ni ort): mismas matemáticas que el
    script de verificación en Python. Se pueden probar en Node. --- */
 function tilePositions(n) {
   const max0 = Math.max(n - TILE, 0);
@@ -118,8 +127,33 @@ async function stylizeTiled(input, H, W, runTile, onProgress) {
   }
   return res;
 }
+/* Transposición NHWC <-> NCHW (pura): el modelo ONNX espera [1,3,H,W]
+   (canal primero) y el acumulador de tiles trabaja en NHWC (canal último).
+   data: Float32Array de H*W*3. */
+function transposeNHWCtoNCHW(data, H, W) {
+  const out = new Float32Array(H * W * 3);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      for (let c = 0; c < 3; c++) {
+        out[(c * H + y) * W + x] = data[(y * W + x) * 3 + c];
+      }
+    }
+  }
+  return out;
+}
+function transposeNCHWtoNHWC(data, H, W) {
+  const out = new Float32Array(H * W * 3);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      for (let c = 0; c < 3; c++) {
+        out[(y * W + x) * 3 + c] = data[(c * H + y) * W + x];
+      }
+    }
+  }
+  return out;
+}
 if (typeof module !== 'undefined') {
-  module.exports = { TILE, OVERLAP, STRIDE, tilePositions, makeRamp, reflectIndex, reflectPadTile, stylizeTiled };
+  module.exports = { TILE, OVERLAP, STRIDE, tilePositions, makeRamp, reflectIndex, reflectPadTile, stylizeTiled, transposeNHWCtoNCHW, transposeNCHWtoNHWC };
 }
 
 /* --- Interfaz (solo navegador) --- */
@@ -131,12 +165,29 @@ if (typeof document !== 'undefined') {
 
   function estado(msg) { $('estado').textContent = msg; }
   function error(msg) { $('error').textContent = msg || ''; }
+  function fallo(etapa, e) {
+    const err = new Error(e && e.message ? e.message : String(e));
+    err.etapa = etapa;
+    throw err;
+  }
 
   async function cargarModelo(nombre) {
     if (!cargados[nombre]) {
+      if (typeof ort === 'undefined') {
+        fallo('inicio', new Error('no se cargó onnxruntime-web (ort). Revisa la conexión al CDN.'));
+      }
       estado('Cargando modelo ' + MODELOS[nombre].etiqueta + '…');
-      tflite.setWasmPath(WASM_URL);
-      cargados[nombre] = await tflite.loadTFLiteModel(MODELOS[nombre].url);
+      /* Un solo hilo SIMD: GitHub Pages no envía COOP/COEP, así que no hay
+         SharedArrayBuffer ni multihilo; con numThreads = 1 carga
+         ort-wasm-simd.wasm, que no lo necesita. */
+      ort.env.wasm.wasmPaths = ORT_DIST;
+      ort.env.wasm.numThreads = 1;
+      try {
+        cargados[nombre] = await ort.InferenceSession.create(
+          MODELOS[nombre].url, { executionProviders: ['wasm'] });
+      } catch (e) {
+        fallo('carga del modelo', e);
+      }
     }
     return cargados[nombre];
   }
@@ -145,14 +196,19 @@ if (typeof document !== 'undefined') {
     if (!fotoRGB) return;
     error('');
     try {
-      await tf.ready();
       const modelo = await cargarModelo(modeloActual);
       const t0 = performance.now();
-      const runTile = (patch) => tf.tidy(() => {
-        const t = tf.tensor(patch, [1, TILE, TILE, 3], 'float32');
-        const out = modelo.predict(t);
-        return out.dataSync();
-      });
+      const runTile = async (patch) => {
+        const nchw = transposeNHWCtoNCHW(patch, TILE, TILE);
+        const tensor = new ort.Tensor('float32', nchw, [1, 3, TILE, TILE]);
+        let salida;
+        try {
+          salida = await modelo.run({ [ENTRADA]: tensor });
+        } catch (e) {
+          fallo('inferencia', e);
+        }
+        return transposeNCHWtoNHWC(salida[SALIDA].data, TILE, TILE);
+      };
       const res = await stylizeTiled(fotoRGB, fotoH, fotoW, runTile,
         (hecho, total) => estado('Procesando ' + hecho + '/' + total + '…'));
       const canvas = $('resultado');
@@ -173,8 +229,8 @@ if (typeof document !== 'undefined') {
         ((performance.now() - t0) / 1000).toFixed(1) + ' s).');
     } catch (e) {
       console.error(e);
-      estado('Falló. Revisa el error abajo.');
-      error('Error: ' + (e && e.message ? e.message : e));
+      estado('Falló en ' + (e.etapa || 'desconocido') + '. Revisa el error abajo.');
+      error('Error [' + (e.etapa || '?') + ']: ' + (e && e.message ? e.message : e));
     }
   }
 
