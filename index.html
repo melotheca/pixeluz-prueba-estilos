@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba de estilos Johnson</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 900px; }
+  img, canvas { max-width: 100%; height: auto; display: block; margin: 8px 0; }
+  button { margin: 4px 4px 4px 0; padding: 8px 14px; }
+  button.on { font-weight: bold; }
+  #estado { margin: 8px 0; }
+  #error { color: #b00020; white-space: pre-wrap; }
+  #descargar { display: none; margin: 8px 0; }
+</style>
+</head>
+<body>
+<input type="file" id="foto" accept="image/*">
+<button id="m-vangogh" class="on" type="button">Van Gogh</button>
+<button id="m-ukiyoe" type="button">Ukiyo-e</button>
+<p id="estado">Elige una foto.</p>
+<p id="error"></p>
+<img id="original" alt="">
+<canvas id="resultado"></canvas>
+<a id="descargar" download="foto-estilo.png" href="#">Descargar resultado</a>
+<p>Tu foto se procesa en tu propio navegador y no se sube a ningún servidor.</p>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
+<script>
+/* Prueba de estilos Johnson (Pixeluz) en el navegador.
+   Modelos .tflite (Johnson, TransformerNet): entrada/salida [1,256,256,3]
+   FP32, RGB en [0,1]. Solo aceptan 256x256: la foto se parte en tiles de
+   256 con solape de 64 y mezcla lineal, igual que la verificación local
+   (verify_ukiyoe_tflite.py). Todo corre en el navegador con tfjs-tflite;
+   la foto nunca sale del dispositivo. */
+const TILE = 256, OVERLAP = 64, STRIDE = TILE - OVERLAP;
+const MAX_LADO = 2048;
+const MODELOS = {
+  vangogh: { url: 'models/johnson_vangogh_fp32.tflite', etiqueta: 'Van Gogh' },
+  ukiyoe: { url: 'models/johnson_ukiyoe_fp32.tflite', etiqueta: 'Ukiyo-e' }
+};
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/wasm/';
+
+/* --- Funciones puras (sin DOM ni tf): mismas matemáticas que el
+   script de verificación en Python. Se pueden probar en Node. --- */
+function tilePositions(n) {
+  const max0 = Math.max(n - TILE, 0);
+  const pos = [];
+  for (let p = 0; p <= max0; p += STRIDE) pos.push(p);
+  if (pos[pos.length - 1] !== max0) pos.push(max0);
+  return pos;
+}
+function makeRamp() {
+  const r = new Float64Array(TILE).fill(1);
+  for (let i = 0; i < OVERLAP; i++) {
+    r[i] = i / OVERLAP;                 /* linspace(0,1,64,endpoint=False) */
+    r[TILE - OVERLAP + i] = 1 - i / OVERLAP; /* linspace(1,0,64,endpoint=False) */
+  }
+  return r;
+}
+/* Índice reflejado (modo 'reflect' de numpy) para un eje de longitud n. */
+function reflectIndex(i, n) {
+  if (n <= 1) return 0;
+  const periodo = 2 * n - 2;
+  let j = ((i % periodo) + periodo) % periodo;
+  if (j >= n) j = periodo - j;
+  return j;
+}
+/* Extrae el tile en (y0,x0) de tamaño ph x pw y lo rellena con reflect a 256x256. */
+function reflectPadTile(input, H, W, y0, x0, ph, pw) {
+  const out = new Float32Array(TILE * TILE * 3);
+  for (let y = 0; y < TILE; y++) {
+    const sy = y0 + reflectIndex(y, ph);
+    for (let x = 0; x < TILE; x++) {
+      const sx = x0 + reflectIndex(x, pw);
+      const s = (sy * W + sx) * 3, d = (y * TILE + x) * 3;
+      out[d] = input[s]; out[d + 1] = input[s + 1]; out[d + 2] = input[s + 2];
+    }
+  }
+  return out;
+}
+/* Estiliza la foto completa por tiles. runTile(tile256) -> Float32Array 256*256*3.
+   Nota: igual que en la verificación en Python, la primera fila y la primera
+   columna quedan en negro (la rampa vale 0 en el borde): es 1 px, invisible. */
+async function stylizeTiled(input, H, W, runTile, onProgress) {
+  const ys = tilePositions(H), xs = tilePositions(W);
+  const acc = new Float64Array(H * W * 3);
+  const wsum = new Float64Array(H * W);
+  const ramp = makeRamp();
+  let hecho = 0;
+  const total = ys.length * xs.length;
+  for (const y0 of ys) {
+    for (const x0 of xs) {
+      const ph = Math.min(TILE, H - y0), pw = Math.min(TILE, W - x0);
+      const patch = reflectPadTile(input, H, W, y0, x0, ph, pw);
+      const out = await runTile(patch);
+      for (let y = 0; y < ph; y++) {
+        for (let x = 0; x < pw; x++) {
+          const w = ramp[y] * ramp[x];
+          const s = (y0 + y) * W + (x0 + x);
+          const o = (y * TILE + x) * 3;
+          acc[s * 3] += out[o] * w;
+          acc[s * 3 + 1] += out[o + 1] * w;
+          acc[s * 3 + 2] += out[o + 2] * w;
+          wsum[s] += w;
+        }
+      }
+      hecho++;
+      if (onProgress) onProgress(hecho, total);
+    }
+  }
+  const res = new Float32Array(H * W * 3);
+  for (let i = 0; i < H * W; i++) {
+    const w = Math.max(wsum[i], 1e-9);
+    res[i * 3] = Math.min(1, Math.max(0, acc[i * 3] / w));
+    res[i * 3 + 1] = Math.min(1, Math.max(0, acc[i * 3 + 1] / w));
+    res[i * 3 + 2] = Math.min(1, Math.max(0, acc[i * 3 + 2] / w));
+  }
+  return res;
+}
+if (typeof module !== 'undefined') {
+  module.exports = { TILE, OVERLAP, STRIDE, tilePositions, makeRamp, reflectIndex, reflectPadTile, stylizeTiled };
+}
+
+/* --- Interfaz (solo navegador) --- */
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  let modeloActual = 'vangogh';
+  const cargados = {};
+  let fotoRGB = null, fotoH = 0, fotoW = 0;
+
+  function estado(msg) { $('estado').textContent = msg; }
+  function error(msg) { $('error').textContent = msg || ''; }
+
+  async function cargarModelo(nombre) {
+    if (!cargados[nombre]) {
+      estado('Cargando modelo ' + MODELOS[nombre].etiqueta + '…');
+      tflite.setWasmPath(WASM_URL);
+      cargados[nombre] = await tflite.loadTFLiteModel(MODELOS[nombre].url);
+    }
+    return cargados[nombre];
+  }
+
+  async function aplicarEstilo() {
+    if (!fotoRGB) return;
+    error('');
+    try {
+      await tf.ready();
+      const modelo = await cargarModelo(modeloActual);
+      const t0 = performance.now();
+      const runTile = (patch) => tf.tidy(() => {
+        const t = tf.tensor(patch, [1, TILE, TILE, 3], 'float32');
+        const out = modelo.predict(t);
+        return out.dataSync();
+      });
+      const res = await stylizeTiled(fotoRGB, fotoH, fotoW, runTile,
+        (hecho, total) => estado('Procesando ' + hecho + '/' + total + '…'));
+      const canvas = $('resultado');
+      canvas.width = fotoW; canvas.height = fotoH;
+      const ctx = canvas.getContext('2d');
+      const imgData = ctx.createImageData(fotoW, fotoH);
+      for (let i = 0; i < fotoW * fotoH; i++) {
+        imgData.data[i * 4] = Math.round(res[i * 3] * 255);
+        imgData.data[i * 4 + 1] = Math.round(res[i * 3 + 1] * 255);
+        imgData.data[i * 4 + 2] = Math.round(res[i * 3 + 2] * 255);
+        imgData.data[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      const enlace = $('descargar');
+      enlace.href = canvas.toDataURL('image/png');
+      enlace.style.display = 'inline';
+      estado('Listo (' + MODELOS[modeloActual].etiqueta + ', ' +
+        ((performance.now() - t0) / 1000).toFixed(1) + ' s).');
+    } catch (e) {
+      console.error(e);
+      estado('Falló. Revisa el error abajo.');
+      error('Error: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  $('foto').addEventListener('change', async (ev) => {
+    const archivo = ev.target.files[0];
+    if (!archivo) return;
+    error('');
+    try {
+      const url = URL.createObjectURL(archivo);
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      let w = img.naturalWidth, h = img.naturalHeight;
+      let reducido = false;
+      if (Math.max(w, h) > MAX_LADO) {
+        const f = MAX_LADO / Math.max(w, h);
+        w = Math.round(w * f); h = Math.round(h * f);
+        reducido = true;
+      }
+      $('original').src = url;
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      const datos = ctx.getImageData(0, 0, w, h).data;
+      fotoW = w; fotoH = h;
+      fotoRGB = new Float32Array(w * h * 3);
+      for (let i = 0; i < w * h; i++) {
+        fotoRGB[i * 3] = datos[i * 4] / 255;
+        fotoRGB[i * 3 + 1] = datos[i * 4 + 1] / 255;
+        fotoRGB[i * 3 + 2] = datos[i * 4 + 2] / 255;
+      }
+      estado('Foto cargada' + (reducido ? ' (reducida a ' + w + 'x' + h + ')' : '') + '. Aplicando estilo…');
+      aplicarEstilo();
+    } catch (e) {
+      console.error(e);
+      estado('No se pudo cargar la foto.');
+      error('Error: ' + (e && e.message ? e.message : e));
+    }
+  });
+
+  function elegirModelo(nombre) {
+    modeloActual = nombre;
+    $('m-vangogh').classList.toggle('on', nombre === 'vangogh');
+    $('m-ukiyoe').classList.toggle('on', nombre === 'ukiyoe');
+    aplicarEstilo();
+  }
+  $('m-vangogh').addEventListener('click', () => elegirModelo('vangogh'));
+  $('m-ukiyoe').addEventListener('click', () => elegirModelo('ukiyoe'));
+}
+</script>
+</body>
+</html>
