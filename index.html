@@ -22,7 +22,7 @@
 <p id="error"></p>
 <img id="original" alt="">
 <canvas id="resultado"></canvas>
-<a id="descargar" download="foto-estilo.png" href="#">Descargar resultado</a>
+<button id="descargar" type="button" style="display:none">Descargar a tamaño completo</button>
 <p>Tu foto se procesa en tu propio navegador y no se sube a ningún servidor.</p>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
 <script>
@@ -42,6 +42,7 @@
    la foto nunca sale del dispositivo. */
 const TILE = 256, OVERLAP = 64, STRIDE = TILE - OVERLAP;
 const MAX_LADO = 2048;
+const PREVIEW_LADO = 512; /* vista previa rápida: lado mayor 512 */
 const MODELOS = {
   vangogh: { url: 'models/johnson_vangogh.onnx', etiqueta: 'Van Gogh' },
   ukiyoe: { url: 'models/johnson_ukiyoe.onnx', etiqueta: 'Ukiyo-e' }
@@ -162,6 +163,8 @@ if (typeof document !== 'undefined') {
   let modeloActual = 'vangogh';
   const cargados = {};
   let fotoRGB = null, fotoH = 0, fotoW = 0;
+  let vistaRGB = null, vistaH = 0, vistaW = 0; /* vista previa reducida */
+  let descargaCache = {}; /* dataURL a tamaño completo, por estilo */
 
   function estado(msg) { $('estado').textContent = msg; }
   function error(msg) { $('error').textContent = msg || ''; }
@@ -192,40 +195,47 @@ if (typeof document !== 'undefined') {
     return cargados[nombre];
   }
 
+  /* Estiliza un buffer RGB (NHWC, valores [0,1]) y devuelve el resultado. */
+  async function estilizar(rgb, H, W, modelo, onProgress) {
+    const runTile = async (patch) => {
+      const nchw = transposeNHWCtoNCHW(patch, TILE, TILE);
+      const tensor = new ort.Tensor('float32', nchw, [1, 3, TILE, TILE]);
+      let salida;
+      try {
+        salida = await modelo.run({ [ENTRADA]: tensor });
+      } catch (e) {
+        fallo('inferencia', e);
+      }
+      return transposeNCHWtoNHWC(salida[SALIDA].data, TILE, TILE);
+    };
+    return stylizeTiled(rgb, H, W, runTile, onProgress);
+  }
+  /* Dibuja un resultado (Float32Array NHWC [0,1]) en un canvas. */
+  function dibujar(canvas, res, W, H) {
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.createImageData(W, H);
+    for (let i = 0; i < W * H; i++) {
+      imgData.data[i * 4] = Math.round(res[i * 3] * 255);
+      imgData.data[i * 4 + 1] = Math.round(res[i * 3 + 1] * 255);
+      imgData.data[i * 4 + 2] = Math.round(res[i * 3 + 2] * 255);
+      imgData.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+
+  /* Vista previa rápida: procesa la foto reducida (lado mayor 512). */
   async function aplicarEstilo() {
-    if (!fotoRGB) return;
+    if (!vistaRGB) return;
     error('');
     try {
       const modelo = await cargarModelo(modeloActual);
       const t0 = performance.now();
-      const runTile = async (patch) => {
-        const nchw = transposeNHWCtoNCHW(patch, TILE, TILE);
-        const tensor = new ort.Tensor('float32', nchw, [1, 3, TILE, TILE]);
-        let salida;
-        try {
-          salida = await modelo.run({ [ENTRADA]: tensor });
-        } catch (e) {
-          fallo('inferencia', e);
-        }
-        return transposeNCHWtoNHWC(salida[SALIDA].data, TILE, TILE);
-      };
-      const res = await stylizeTiled(fotoRGB, fotoH, fotoW, runTile,
-        (hecho, total) => estado('Procesando ' + hecho + '/' + total + '…'));
-      const canvas = $('resultado');
-      canvas.width = fotoW; canvas.height = fotoH;
-      const ctx = canvas.getContext('2d');
-      const imgData = ctx.createImageData(fotoW, fotoH);
-      for (let i = 0; i < fotoW * fotoH; i++) {
-        imgData.data[i * 4] = Math.round(res[i * 3] * 255);
-        imgData.data[i * 4 + 1] = Math.round(res[i * 3 + 1] * 255);
-        imgData.data[i * 4 + 2] = Math.round(res[i * 3 + 2] * 255);
-        imgData.data[i * 4 + 3] = 255;
-      }
-      ctx.putImageData(imgData, 0, 0);
-      const enlace = $('descargar');
-      enlace.href = canvas.toDataURL('image/png');
-      enlace.style.display = 'inline';
-      estado('Listo (' + MODELOS[modeloActual].etiqueta + ', ' +
+      const res = await estilizar(vistaRGB, vistaH, vistaW, modelo,
+        (hecho, total) => estado('Procesando vista previa ' + hecho + '/' + total + '…'));
+      dibujar($('resultado'), res, vistaW, vistaH);
+      $('descargar').style.display = 'inline';
+      estado('Listo (' + MODELOS[modeloActual].etiqueta + ', vista previa, ' +
         ((performance.now() - t0) / 1000).toFixed(1) + ' s).');
     } catch (e) {
       console.error(e);
@@ -233,6 +243,47 @@ if (typeof document !== 'undefined') {
       error('Error [' + (e.etapa || '?') + ']: ' + (e && e.message ? e.message : e));
     }
   }
+
+  /* Descarga a tamaño completo: genera el resultado a tamaño original
+     (tarda lo mismo que antes, ~35 s para 1404x1120) y lo descarga.
+     La descarga en sí es instantánea (se genera en el navegador); lo que
+     tarda es generar el resultado completo. */
+  async function descargarCompleto() {
+    if (!fotoRGB) return;
+    if (vistaW === fotoW && vistaH === fotoH) {
+      bajar($('resultado').toDataURL('image/png'));
+      return;
+    }
+    if (descargaCache[modeloActual]) {
+      bajar(descargaCache[modeloActual]);
+      return;
+    }
+    error('');
+    try {
+      const modelo = await cargarModelo(modeloActual);
+      const t0 = performance.now();
+      const res = await estilizar(fotoRGB, fotoH, fotoW, modelo,
+        (hecho, total) => estado('Generando descarga a tamaño completo ' + hecho + '/' + total + '…'));
+      const canvas = document.createElement('canvas');
+      dibujar(canvas, res, fotoW, fotoH);
+      const url = canvas.toDataURL('image/png');
+      descargaCache[modeloActual] = url;
+      estado('Listo (' + MODELOS[modeloActual].etiqueta + ', tamaño completo, ' +
+        ((performance.now() - t0) / 1000).toFixed(1) + ' s). Descargando…');
+      bajar(url);
+    } catch (e) {
+      console.error(e);
+      estado('Falló en ' + (e.etapa || 'desconocido') + '. Revisa el error abajo.');
+      error('Error [' + (e.etapa || '?') + ']: ' + (e && e.message ? e.message : e));
+    }
+  }
+  function bajar(url) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'foto-estilo.png';
+    a.click();
+  }
+  $('descargar').addEventListener('click', descargarCompleto);
 
   $('foto').addEventListener('change', async (ev) => {
     const archivo = ev.target.files[0];
@@ -263,7 +314,25 @@ if (typeof document !== 'undefined') {
         fotoRGB[i * 3 + 1] = datos[i * 4 + 1] / 255;
         fotoRGB[i * 3 + 2] = datos[i * 4 + 2] / 255;
       }
-      estado('Foto cargada' + (reducido ? ' (reducida a ' + w + 'x' + h + ')' : '') + '. Aplicando estilo…');
+      /* Vista previa reducida (lado mayor 512) para procesar rápido. */
+      descargaCache = {};
+      let vw = w, vh = h;
+      if (Math.max(vw, vh) > PREVIEW_LADO) {
+        const f = PREVIEW_LADO / Math.max(vw, vh);
+        vw = Math.round(vw * f); vh = Math.round(vh * f);
+      }
+      const canvasP = document.createElement('canvas');
+      canvasP.width = vw; canvasP.height = vh;
+      canvasP.getContext('2d').drawImage(canvas, 0, 0, vw, vh);
+      const datosP = canvasP.getContext('2d').getImageData(0, 0, vw, vh).data;
+      vistaW = vw; vistaH = vh;
+      vistaRGB = new Float32Array(vw * vh * 3);
+      for (let i = 0; i < vw * vh; i++) {
+        vistaRGB[i * 3] = datosP[i * 4] / 255;
+        vistaRGB[i * 3 + 1] = datosP[i * 4 + 1] / 255;
+        vistaRGB[i * 3 + 2] = datosP[i * 4 + 2] / 255;
+      }
+      estado('Foto cargada' + (reducido ? ' (reducida a ' + w + 'x' + h + ')' : '') + '. Aplicando estilo (vista previa)…');
       aplicarEstilo();
     } catch (e) {
       console.error(e);
