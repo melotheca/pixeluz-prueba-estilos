@@ -23,7 +23,7 @@
 <p id="error"></p>
 <img id="original" alt="">
 <canvas id="resultado"></canvas>
-<button id="descargar" type="button" style="display:none">Descargar a tamaño completo</button>
+<button id="descargar" type="button" style="display:none">Descargar</button>
 <p>Tu foto se procesa en tu propio navegador y no se sube a ningún servidor.</p>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
 <script>
@@ -166,7 +166,6 @@ if (typeof document !== 'undefined') {
   const cargados = {};
   let fotoRGB = null, fotoH = 0, fotoW = 0;
   let vistaRGB = null, vistaH = 0, vistaW = 0; /* vista previa reducida */
-  let descargaCache = {}; /* dataURL a tamaño completo, por estilo */
 
   function estado(msg) { $('estado').textContent = msg; }
   function error(msg) { $('error').textContent = msg || ''; }
@@ -246,38 +245,11 @@ if (typeof document !== 'undefined') {
     }
   }
 
-  /* Descarga a tamaño completo: genera el resultado a tamaño original
-     (tarda lo mismo que antes, ~35 s para 1404x1120) y lo descarga.
-     La descarga en sí es instantánea (se genera en el navegador); lo que
-     tarda es generar el resultado completo. */
-  async function descargarCompleto() {
-    if (!fotoRGB) return;
-    if (vistaW === fotoW && vistaH === fotoH) {
-      bajar($('resultado').toDataURL('image/png'));
-      return;
-    }
-    if (descargaCache[modeloActual]) {
-      bajar(descargaCache[modeloActual]);
-      return;
-    }
-    error('');
-    try {
-      const modelo = await cargarModelo(modeloActual);
-      const t0 = performance.now();
-      const res = await estilizar(fotoRGB, fotoH, fotoW, modelo,
-        (hecho, total) => estado('Generando descarga a tamaño completo ' + hecho + '/' + total + '…'));
-      const canvas = document.createElement('canvas');
-      dibujar(canvas, res, fotoW, fotoH);
-      const url = canvas.toDataURL('image/png');
-      descargaCache[modeloActual] = url;
-      estado('Listo (' + MODELOS[modeloActual].etiqueta + ', tamaño completo, ' +
-        ((performance.now() - t0) / 1000).toFixed(1) + ' s). Descargando…');
-      bajar(url);
-    } catch (e) {
-      console.error(e);
-      estado('Falló en ' + (e.etapa || 'desconocido') + '. Revisa el error abajo.');
-      error('Error [' + (e.etapa || '?') + ']: ' + (e && e.message ? e.message : e));
-    }
+  /* Descarga la vista previa tal cual se ve (lado mayor 512): instantánea,
+     sin generar el resultado a tamaño completo. */
+  function descargarPrevia() {
+    if (!vistaRGB) return;
+    bajar($('resultado').toDataURL('image/png'));
   }
   function bajar(url) {
     const a = document.createElement('a');
@@ -285,7 +257,7 @@ if (typeof document !== 'undefined') {
     a.download = 'foto-estilo.png';
     a.click();
   }
-  $('descargar').addEventListener('click', descargarCompleto);
+  $('descargar').addEventListener('click', descargarPrevia);
 
   $('foto').addEventListener('change', async (ev) => {
     const archivo = ev.target.files[0];
@@ -317,7 +289,6 @@ if (typeof document !== 'undefined') {
         fotoRGB[i * 3 + 2] = datos[i * 4 + 2] / 255;
       }
       /* Vista previa reducida (lado mayor 512) para procesar rápido. */
-      descargaCache = {};
       let vw = w, vh = h;
       if (Math.max(vw, vh) > PREVIEW_LADO) {
         const f = PREVIEW_LADO / Math.max(vw, vh);
