@@ -18,6 +18,7 @@
 <input type="file" id="foto" accept="image/*">
 <button id="m-vangogh" class="on" type="button">Van Gogh</button>
 <button id="m-ukiyoe" type="button">Ukiyo-e</button>
+  <button id="m-triangulos" type="button">Triángulos</button>
 <p id="estado">Elige una foto.</p>
 <p id="error"></p>
 <img id="original" alt="">
@@ -45,7 +46,8 @@ const MAX_LADO = 2048;
 const PREVIEW_LADO = 512; /* vista previa rápida: lado mayor 512 */
 const MODELOS = {
   vangogh: { url: 'models/johnson_vangogh.onnx', etiqueta: 'Van Gogh' },
-  ukiyoe: { url: 'models/johnson_ukiyoe.onnx', etiqueta: 'Ukiyo-e' }
+  ukiyoe: { url: 'models/johnson_ukiyoe.onnx', etiqueta: 'Ukiyo-e' },
+  triangulos: { url: 'models/johnson_triangulos.onnx', etiqueta: 'Triángulos' },
 };
 const ORT_VERSION = '1.18.0';
 const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VERSION + '/dist/';
@@ -345,10 +347,12 @@ if (typeof document !== 'undefined') {
     modeloActual = nombre;
     $('m-vangogh').classList.toggle('on', nombre === 'vangogh');
     $('m-ukiyoe').classList.toggle('on', nombre === 'ukiyoe');
+    $('m-triangulos').classList.toggle('on', nombre === 'triangulos');
     aplicarEstilo();
   }
   $('m-vangogh').addEventListener('click', () => elegirModelo('vangogh'));
   $('m-ukiyoe').addEventListener('click', () => elegirModelo('ukiyoe'));
+  $('m-triangulos').addEventListener('click', () => elegirModelo('triangulos'));
 }
 </script>
 </body>
